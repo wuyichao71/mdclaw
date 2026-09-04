@@ -308,6 +308,8 @@ GUARDRAIL_CODES: dict[str, str] = {
     "distance_restraint_selection_invalid": "Provide valid mdtraj selections for both restraint groups.",
     "distance_restraint_groups_overlap": "Use disjoint atom groups for a distance restraint.",
     "distance_restraint_topology_mismatch": "Use a matching system.xml and topology.pdb artifact pair.",
+    "restraint_type_invalid": "Use restraint type distance, angle or dihedral.",
+    "restraint_target_out_of_range": "Use 0-180 deg for an angle restraint and -180-180 deg for a dihedral restraint.",
     "production_bias_conflict": "Choose either distance restraints or a custom force script.",
     "production_bias_checkpoint_unsupported": "Restart biased production from a portable XML state.",
     "equilibration_time_step_conflict": "Resolve the equilibration time-step conflict (HMR vs dt).",

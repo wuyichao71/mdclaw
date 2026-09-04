@@ -314,3 +314,120 @@ def test_load_distance_restraint_rejects_water_and_bare_ions():
     assert exc.value.code == "distance_restraints_invalid"
     assert "1 water residue(s) and 1 bare-ion residue(s)" in str(exc.value)
     assert "use resid rather than resSeq" in str(exc.value)
+
+
+def _angle_fixture(restraint_type):
+    """Topology + system + one angle/dihedral restraint on carbons."""
+    topology = Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("ALA", chain)
+    system = System()
+    group_count = 3 if restraint_type == "angle" else 4
+    for index in range(group_count):
+        topology.addAtom(f"C{index}", element.carbon, residue)
+        system.addParticle(12.0 * dalton)
+    restraint = {
+        "name": "theta" if restraint_type == "angle" else "phi",
+        "type": restraint_type,
+        "force_constant_kj_mol_rad2": 100.0,
+        "target_angle_deg": 90.0 if restraint_type == "angle" else 170.0,
+    }
+    for index in range(1, group_count + 1):
+        restraint[f"selection_group{index}"] = f"index {index - 1}"
+    return topology, system, [restraint]
+
+
+def test_distance_restraint_signature_stays_schema_v1_for_distance_only():
+    """A distance-only payload must keep its original kind and field set."""
+    _, _, restraints = _distance_restraint_fixture()
+    signature_value = distance_restraint_signature(restraints)
+
+    assert signature_value["kind"] == "openmm_centroid_distance_restraints"
+    assert set(signature_value) == {"kind", "mass_weighting", "restraints"}
+    assert "type" not in signature_value["restraints"][0]
+
+
+@pytest.mark.parametrize("restraint_type", ["angle", "dihedral"])
+def test_angle_restraint_signature_reports_type_and_radians(restraint_type):
+    _, _, restraints = _angle_fixture(restraint_type)
+    signature_value = distance_restraint_signature(restraints)
+
+    assert signature_value["kind"] == "openmm_centroid_restraints"
+    assert signature_value["types"] == [restraint_type]
+    assert signature_value["angle_cv_unit"] == "radian"
+    entry = signature_value["restraints"][0]
+    assert entry["type"] == restraint_type
+    # Nothing derived may appear: node conditions are compared verbatim
+    # against this payload.
+    assert "target_angle_rad" not in entry
+    assert set(entry) == {
+        "name", "type", "force_constant_kj_mol_rad2", "target_angle_deg",
+    } | {
+        f"selection_group{index}"
+        for index in range(1, 4 if restraint_type == "angle" else 5)
+    }
+
+
+def test_normalize_distance_restraints_is_idempotent_for_angles():
+    """distance_restraint_signature() re-normalizes its own output."""
+    _, _, restraints = _angle_fixture("dihedral")
+    once = normalize_distance_restraints(restraints)
+    assert normalize_distance_restraints(once) == once
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "code"),
+    [
+        ({"type": "bogus"}, "restraint_type_invalid"),
+        ({"target_angle_deg": 200.0}, "restraint_target_out_of_range"),
+        ({"target_angle_deg": -181.0}, "restraint_target_out_of_range"),
+        ({"force_constant_kj_mol_rad2": 0.0}, "distance_restraints_invalid"),
+    ],
+)
+def test_angle_restraint_schema_rejections(payload_update, code):
+    _, _, restraints = _angle_fixture("dihedral")
+    restraints[0].update(payload_update)
+    with pytest.raises(DistanceRestraintError) as exc:
+        normalize_distance_restraints(restraints)
+    assert exc.value.code == code
+
+
+def test_angle_restraint_requires_its_own_group_count():
+    _, _, restraints = _angle_fixture("dihedral")
+    del restraints[0]["selection_group4"]
+    with pytest.raises(DistanceRestraintError) as exc:
+        normalize_distance_restraints(restraints)
+    assert exc.value.code == "distance_restraints_invalid"
+
+    _, _, angle_restraints = _angle_fixture("angle")
+    angle_restraints[0]["selection_group4"] = "index 0"
+    with pytest.raises(DistanceRestraintError) as exc:
+        normalize_distance_restraints(angle_restraints)
+    assert exc.value.code == "distance_restraints_invalid"
+
+
+def test_mixed_restraint_types_build_one_force_each():
+    topology, system, distance_restraints = _distance_restraint_fixture()
+    dihedral = {
+        "name": "phi",
+        "type": "dihedral",
+        "selection_group1": "index 0",
+        "selection_group2": "index 1",
+        "selection_group3": "index 2",
+        "selection_group4": "index 3",
+        "force_constant_kj_mol_rad2": 100.0,
+        "target_angle_deg": 170.0,
+    }
+    loaded = load_distance_restraints(
+        system=system,
+        topology=topology,
+        distance_restraints=distance_restraints + [dihedral],
+        is_periodic=False,
+    )
+
+    # One CustomCentroidBondForce carries a single energy expression, so a
+    # mixed payload must produce one force per restraint type.
+    assert len(loaded["forces"]) == 2
+    assert {force.getNumGroupsPerBond() for force in loaded["forces"]} == {2, 4}
+    assert loaded["cv_names"] == ["group_distance", "phi"]
+    assert loaded["kind"] == "openmm_centroid_restraints"

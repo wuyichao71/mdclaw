@@ -1,23 +1,44 @@
-# Production MD: Harmonic Distance Restraints
+# Production MD: Harmonic Distance / Angle / Dihedral Restraints
 
-Use `--distance-restraints` for harmonic distances between two atoms or two
-centers of mass. This route uses native OpenMM forces; do not write a
-`--custom-force-script` for a potential this page can express.
+Use `--distance-restraints` for harmonic restraints on a distance, an angle, or
+a dihedral between mdtraj selections (each group is a mass-weighted centroid).
+This route uses native OpenMM forces; do not write a `--custom-force-script`
+for a potential this page can express - measured on a 10 k-atom system the
+custom-force route is ~4.6x slower for the same harmonic distance bias, and it
+cannot run at all on GPUs newer than the container's PyTorch build supports.
 
-Each restraint object requires exactly these fields:
+`type` selects the restraint and decides which other fields are required. It is
+optional and defaults to `distance`, so schema-v1 payloads stay valid.
 
-| Field | Meaning |
-|---|---|
-| `name` | Unique identifier and CV column name; use letters, digits, and underscores. |
-| `selection_group1` | First mdtraj selection. |
-| `selection_group2` | Second mdtraj selection. |
-| `force_constant_kj_mol_nm2` | Positive harmonic force constant. |
-| `target_distance_nm` | Non-negative target distance. |
+| `type` | Groups | Force constant | Target |
+|---|---|---|---|
+| `distance` (default) | `selection_group1`, `selection_group2` | `force_constant_kj_mol_nm2` | `target_distance_nm` (>= 0) |
+| `angle` | `selection_group1` .. `selection_group3` | `force_constant_kj_mol_rad2` | `target_angle_deg` (0 .. 180) |
+| `dihedral` | `selection_group1` .. `selection_group4` | `force_constant_kj_mol_rad2` | `target_angle_deg` (-180 .. 180) |
 
-The two selections must be non-empty and disjoint. A one-atom selection on
-each side gives an atom-atom distance. Multi-atom groups use physical elemental
-masses, so the CV is unchanged by HMR. Periodic boundary handling follows the
-topology automatically.
+Every restraint also needs `name` - a unique identifier that becomes the CV
+column name; use letters, digits, and underscores. Pass no other keys: node
+conditions are cross-checked against the normalized payload verbatim, so an
+undeclared key fails the node.
+
+Groups within one restraint must be pairwise disjoint. Angle and dihedral
+groups are ordered: `g1-g2-g3` spans the angle at `g2`, and `g1-g2-g3-g4`
+follows the usual dihedral convention about the `g2-g3` bond.
+
+**Units.** Angle targets are given in degrees but `force_constant_kj_mol_rad2`
+is per radian squared, and the CV column is logged in **radians** so that
+`0.5 * k * (cv - target)^2` reproduces the bias directly. Distances stay in nm
+throughout.
+
+**Dihedral periodicity is handled for you.** The angle difference is folded
+into (-pi, pi] before it is squared, so the bias stays continuous across the
++/-180 deg wrap and remains a plain harmonic that WHAM/MBAR can reweight with
+the same `0.5*k*dx^2` expression used for distances.
+
+Every selection must be non-empty. A one-atom selection per group gives the
+plain atom-atom / atom-triple / atom-quadruple coordinate. Multi-atom groups
+use physical elemental masses, so the CV is unchanged by HMR. Periodic boundary
+handling follows the topology automatically.
 
 **Do not use `resSeq` selections on a solvated topology.** PDB residue numbers
 wrap at 9999 and solvated chains reuse them, so a `resSeq` range can silently
@@ -40,6 +61,16 @@ mdclaw create_node --job-dir <job_dir> --node-type prod \
 
 mdclaw --job-dir <job_dir> --node-id <prod_node_id> run_production \
   --simulation-time-ns 100 --distance-restraints "$RESTRAINTS"
+```
+
+A dihedral restraint looks like this - note that `--conditions` must declare
+exactly what the tool will receive:
+
+```bash
+RESTRAINTS='[{"name":"phi_ala2","type":"dihedral",
+  "selection_group1":"index 4","selection_group2":"index 6",
+  "selection_group3":"index 8","selection_group4":"index 14",
+  "force_constant_kj_mol_rad2":145.0,"target_angle_deg":-75.0}]'
 ```
 
 Create one sibling prod node per target distance when running umbrella windows.

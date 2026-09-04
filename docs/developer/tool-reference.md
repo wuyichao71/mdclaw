@@ -395,12 +395,25 @@ signature, update the relevant section here and the matching skill examples.
   `collective_variables.csv` (+ `.meta.json`). See
   `mdclaw/simulation/custom_forces.py`.
   It also accepts `distance_restraints` as one JSON `list[dict]` for native
-  harmonic atom/center-of-mass distances. Every entry requires `name`,
-  `selection_group1`, `selection_group2`,
-  `force_constant_kj_mol_nm2`, and `target_distance_nm`. This route uses an
-  OpenMM `CustomCentroidBondForce` with per-bond parameters, physical elemental
-  mass weights (independent of HMR), automatic periodic displacement handling,
-  and the same collective-variable artifacts. It is
+  harmonic biases on a distance, an angle, or a dihedral between
+  mass-weighted centroids. The optional `type` field
+  (`distance` default / `angle` / `dihedral`) selects the coordinate and fixes
+  the rest of the schema: `distance` takes `selection_group1..2`,
+  `force_constant_kj_mol_nm2` and `target_distance_nm`; `angle` takes
+  `selection_group1..3`, `force_constant_kj_mol_rad2` and `target_angle_deg`
+  (0-180); `dihedral` takes `selection_group1..4`, the same rad-squared force
+  constant and `target_angle_deg` (-180-180). `name` is always required and no
+  other key is accepted, because node conditions are compared against the
+  normalized payload verbatim. This route uses one OpenMM
+  `CustomCentroidBondForce` per restraint type (a single force carries one
+  energy expression and one groups-per-bond count) with per-bond parameters,
+  physical elemental mass weights (independent of HMR), automatic periodic
+  displacement handling, and the same collective-variable artifacts. Dihedral
+  differences are folded into (-pi, pi] so the harmonic stays continuous across
+  the wrap; angle and dihedral CVs are logged in radians to pair with the
+  rad-squared force constant. A distance-only payload keeps the schema-v1
+  signature `openmm_centroid_distance_restraints`; any angle or dihedral
+  present switches it to `openmm_centroid_restraints` with a `types` list. It is
   mutually exclusive with `custom_force_script`; biased restarts require an
   XML state rather than a binary checkpoint.
 

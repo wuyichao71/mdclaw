@@ -7,6 +7,78 @@ add the correction and say what it overturns.
 
 ---
 
+## 2026-09-04 — Declarative restraints cover angle and dihedral; custom-force cost measured
+
+`--distance-restraints` now takes an optional `type` field
+(`distance` default / `angle` / `dihedral`). Angle and dihedral biases therefore
+run in native OpenMM kernels instead of forcing callers onto
+`--custom-force-script`.
+
+Why it mattered — benchmarks on ACE-Ala3-NME (10214 atoms, ff19SB/OPC, NPT
+300 K, 4 fs + HMR), all on one RTX 4000 Ada, 0.5 ns each:
+
+| bias | ns/day | vs unbiased |
+|---|---|---|
+| none | 1146 | 1x |
+| native `--distance-restraints` | 635 | 1.8x slower |
+| custom force, distance, cached `ctx.select` | 138 | 8.3x slower |
+| custom force, dihedral, cached `ctx.select` | 103 | 11x slower |
+| custom force, distance, `ctx.select` every step | 50 | 23x slower |
+| custom force, dihedral, `ctx.select` every step | 34 | 34x slower |
+
+Two separate costs come out of that. The custom-force route is ~4.6x slower
+than native for the *same* harmonic distance potential (138 vs 635), which is
+the per-step Python/autograd overhead. On top of that, re-resolving an mdtraj
+selection inside `energy()` costs ~3x (866 vs 313 s for the same 0.5 ns;
+reproduced on both the distance and dihedral scripts). Both docs now say so.
+
+The 1.8x cost of the native restraint itself is real and not a startup
+artifact: an independent 300 s steady-state window on the same GPU gave
+1324 ns/day unbiased, which puts the startup at ~5 s and leaves the native
+restraint at ~685-758 ns/day. On a 10 k-atom system each step is launch-latency
+bound, so one extra kernel launch plus centroid evaluation plus an isolated
+force-group reduction is expensive in relative terms. Expected to shrink on
+much larger systems — not measured.
+
+Also found: the container's PyTorch (2.7.1+cu118, max sm_90) cannot run
+`PythonTorchForce` on an RTX 5090 (sm_120) and fails with
+`no kernel image is available for execution on the device`. OpenMM's own CUDA
+platform JIT-compiles and works there. Before this change that made the
+fastest GPU in the cluster unusable for dihedral umbrella sampling; it is now
+only a limitation of the custom-force route.
+
+Implementation notes worth keeping:
+
+- One `CustomCentroidBondForce` carries a single energy expression and a single
+  groups-per-bond count, so `load_distance_restraints` builds one force per
+  restraint type present and returns them all in `forces`.
+- A naive harmonic on a raw dihedral difference is discontinuous at the wrap.
+  With `phi0 = 170 deg`, `phi = -179 deg` is 11 deg away but the naive form
+  scores it as 349 deg — 1029.6 vs the correct 152.3 kJ/mol. The energy
+  expression folds the difference into (-pi, pi] with `floor`, which keeps the
+  bias a plain harmonic that WHAM/MBAR reweight with the same `0.5*k*dx^2` used
+  for distances.
+- Nothing derived may enter the normalized payload. A first attempt added
+  `target_angle_rad` and the node failed with `node_execution_context_invalid`:
+  node conditions are compared against the normalized value verbatim, so a key
+  the caller did not declare breaks the run. Degrees are converted to radians
+  at force-build time instead.
+- The numpy CV evaluator initially reported dihedrals with the opposite sign to
+  OpenMM's `dihedral()`, which would have logged a CV inconsistent with the
+  bias actually applied. Caught by scanning phi from -180 to 180 and comparing
+  the logged bias energy against `0.5*k*wrap(cv-phi0)^2`; the two now agree to
+  machine precision, including across the wrap.
+- Distance-only payloads keep the schema-v1 signature
+  `openmm_centroid_distance_restraints` byte-for-byte so previously recorded
+  node conditions still cross-check. Angle/dihedral payloads report
+  `openmm_centroid_restraints` plus a `types` list and `angle_cv_unit`.
+
+Verified: 231 tests pass (10 new), ruff clean, and an end-to-end CLI run of a
+`phi(ALA2)` dihedral restraint (k = 145 kJ/mol/rad^2, target -75 deg) holds the
+angle and reproduces the bias energy frame by frame.
+
+---
+
 ## 2026-09-01 — Named residue-range groups preserve requested components
 
 The preparation skill now treats every effective range, including ranges made

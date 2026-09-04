@@ -1,10 +1,21 @@
 # Production MD: Custom Force / CV Bias (PythonTorchForce)
 
-Attach an arbitrary biasing potential that MDClaw's declarative harmonic
-distance restraint cannot express (for example angle/dihedral bias or an ML
-potential). For harmonic atom/center-of-mass distances, use
-`skills/md-production/distance-restraints.md`; it stays inside native OpenMM
-kernels and avoids per-step Python/autograd overhead.
+Attach an arbitrary biasing potential that the declarative restraint schema
+cannot express - an ML potential, a path CV, or any functional form other than
+a harmonic. **Harmonic distance, angle and dihedral biases all belong to
+`skills/md-production/distance-restraints.md`**, which stays inside native
+OpenMM kernels.
+
+Prefer that route whenever it can express the bias. Measured on a 10 k-atom
+system, the same harmonic distance bias runs ~4.6x slower here than natively
+(138 vs 635 ns/day), and this route additionally fails outright on GPUs whose
+compute capability the container's PyTorch build predates - OpenMM's own CUDA
+platform JIT-compiles its kernels and keeps working there.
+
+**Resolve `ctx.select(...)` once and cache it.** `energy()` runs every step, and
+re-parsing a selection string against the topology each time cost ~3x in
+measurement (866 vs 313 s for the same 0.5 ns). Cache at module level, the way
+the pre-trained-model example below does.
 
 You write one Python function `energy(positions, ctx)` and pass it with
 `--custom-force-script`. **You write only the potential energy; MDClaw

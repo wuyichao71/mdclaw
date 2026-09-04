@@ -10,13 +10,32 @@ from mdclaw.chemistry_constants import WATER_NAMES, is_standard_bare_ion_resname
 
 
 RESTRAINT_SELECTIONS = ("solute_heavy", "CA", "backbone", "heavy")
-_DISTANCE_RESTRAINT_FIELDS = {
-    "name",
-    "selection_group1",
-    "selection_group2",
-    "force_constant_kj_mol_nm2",
-    "target_distance_nm",
+_RESTRAINT_TYPES = ("distance", "angle", "dihedral")
+_RESTRAINT_GROUP_COUNT = {"distance": 2, "angle": 3, "dihedral": 4}
+_RESTRAINT_TARGET_FIELD = {
+    "distance": "target_distance_nm",
+    "angle": "target_angle_deg",
+    "dihedral": "target_angle_deg",
 }
+_RESTRAINT_FORCE_CONSTANT_FIELD = {
+    "distance": "force_constant_kj_mol_nm2",
+    "angle": "force_constant_kj_mol_rad2",
+    "dihedral": "force_constant_kj_mol_rad2",
+}
+# A dihedral difference must be folded into (-pi, pi] before it is squared:
+# a plain harmonic on the raw difference is discontinuous at the +/-180 deg
+# wrap and produces a large spurious force there.
+_TWO_PI_LITERAL = "6.283185307179586"
+_RESTRAINT_ENERGY = {
+    "distance": "0.5*k*(distance(g1,g2)-r0)^2",
+    "angle": "0.5*k*(angle(g1,g2,g3)-r0)^2",
+    "dihedral": (
+        "0.5*k*dphi^2;"
+        f"dphi=dtheta-{_TWO_PI_LITERAL}*floor(0.5+dtheta/{_TWO_PI_LITERAL});"
+        "dtheta=dihedral(g1,g2,g3,g4)-r0"
+    ),
+}
+
 _DISTANCE_RESTRAINT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _BACKBONE_NAMES = {"N", "CA", "C", "O"}
 _SOLUTE_COMPONENT_TYPES = {"protein", "nucleic", "glycan", "ligand", "ion"}
@@ -35,6 +54,18 @@ class DistanceRestraintError(RuntimeError):
     def __init__(self, *, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def _restraint_fields(restraint_type: str) -> set[str]:
+    """Required field names for one restraint type (``type`` stays optional)."""
+    return {
+        "name",
+        _RESTRAINT_FORCE_CONSTANT_FIELD[restraint_type],
+        _RESTRAINT_TARGET_FIELD[restraint_type],
+    } | {
+        f"selection_group{index}"
+        for index in range(1, _RESTRAINT_GROUP_COUNT[restraint_type] + 1)
+    }
 
 
 def normalize_distance_restraints(
@@ -57,8 +88,23 @@ def normalize_distance_restraints(
                 code="distance_restraints_invalid",
                 message=f"distance_restraints[{index}] must be an object.",
             )
-        missing = _DISTANCE_RESTRAINT_FIELDS - set(item)
-        unknown = set(item) - _DISTANCE_RESTRAINT_FIELDS
+        restraint_type = item.get("type", "distance")
+        if restraint_type not in _RESTRAINT_TYPES:
+            raise DistanceRestraintError(
+                code="restraint_type_invalid",
+                message=(
+                    f"distance_restraints[{index}].type must be one of "
+                    + ", ".join(_RESTRAINT_TYPES)
+                    + f"; got {restraint_type!r}."
+                ),
+            )
+        required = _restraint_fields(restraint_type)
+        # Only ``type`` is optional. Nothing derived may enter the normalized
+        # payload: node conditions are cross-checked against it verbatim, so an
+        # extra key the caller did not declare fails the node.
+        allowed = required | {"type"}
+        missing = required - set(item)
+        unknown = set(item) - allowed
         if missing or unknown:
             details = []
             if missing:
@@ -87,7 +133,8 @@ def normalize_distance_restraints(
         names.add(name)
 
         selections = {}
-        for key in ("selection_group1", "selection_group2"):
+        for group_index in range(1, _RESTRAINT_GROUP_COUNT[restraint_type] + 1):
+            key = f"selection_group{group_index}"
             value = item[key]
             if not isinstance(value, str) or not value.strip():
                 raise DistanceRestraintError(
@@ -96,8 +143,10 @@ def normalize_distance_restraints(
                 )
             selections[key] = value.strip()
 
-        force_constant = item["force_constant_kj_mol_nm2"]
-        target_distance = item["target_distance_nm"]
+        force_constant_field = _RESTRAINT_FORCE_CONSTANT_FIELD[restraint_type]
+        target_field = _RESTRAINT_TARGET_FIELD[restraint_type]
+        force_constant = item[force_constant_field]
+        target = item[target_field]
         if (
             isinstance(force_constant, bool)
             or not isinstance(force_constant, (int, float))
@@ -107,16 +156,24 @@ def normalize_distance_restraints(
             raise DistanceRestraintError(
                 code="distance_restraints_invalid",
                 message=(
-                    f"distance_restraints[{index}].force_constant_kj_mol_nm2 "
+                    f"distance_restraints[{index}].{force_constant_field} "
                     "must be finite and greater than 0."
                 ),
             )
         if (
-            isinstance(target_distance, bool)
-            or not isinstance(target_distance, (int, float))
-            or not math.isfinite(float(target_distance))
-            or float(target_distance) < 0.0
+            isinstance(target, bool)
+            or not isinstance(target, (int, float))
+            or not math.isfinite(float(target))
         ):
+            raise DistanceRestraintError(
+                code="distance_restraints_invalid",
+                message=(
+                    f"distance_restraints[{index}].{target_field} must be "
+                    "a finite number."
+                ),
+            )
+        target = float(target)
+        if restraint_type == "distance" and target < 0.0:
             raise DistanceRestraintError(
                 code="distance_restraints_invalid",
                 message=(
@@ -124,13 +181,32 @@ def normalize_distance_restraints(
                     "finite and greater than or equal to 0."
                 ),
             )
+        if restraint_type == "angle" and not 0.0 <= target <= 180.0:
+            raise DistanceRestraintError(
+                code="restraint_target_out_of_range",
+                message=(
+                    f"distance_restraints[{index}].target_angle_deg must be "
+                    "between 0 and 180 for an angle restraint."
+                ),
+            )
+        if restraint_type == "dihedral" and not -180.0 <= target <= 180.0:
+            raise DistanceRestraintError(
+                code="restraint_target_out_of_range",
+                message=(
+                    f"distance_restraints[{index}].target_angle_deg must be "
+                    "between -180 and 180 for a dihedral restraint."
+                ),
+            )
 
-        normalized.append({
-            "name": name,
-            **selections,
-            "force_constant_kj_mol_nm2": float(force_constant),
-            "target_distance_nm": float(target_distance),
-        })
+        entry = {"name": name}
+        if restraint_type != "distance":
+            # Kept out of the payload for plain distance restraints so their
+            # normalized form and signature stay byte-identical to schema v1.
+            entry["type"] = restraint_type
+        entry.update(selections)
+        entry[force_constant_field] = float(force_constant)
+        entry[target_field] = target
+        normalized.append(entry)
     return normalized
 
 
@@ -141,9 +217,20 @@ def distance_restraint_signature(
     normalized = normalize_distance_restraints(distance_restraints)
     if normalized is None:
         return None
+    types = sorted({item.get("type", "distance") for item in normalized})
+    if types == ["distance"]:
+        # Schema v1 signature preserved byte-for-byte so previously recorded
+        # node conditions keep cross-checking.
+        return {
+            "kind": "openmm_centroid_distance_restraints",
+            "mass_weighting": "physical_element",
+            "restraints": normalized,
+        }
     return {
-        "kind": "openmm_centroid_distance_restraints",
+        "kind": "openmm_centroid_restraints",
         "mass_weighting": "physical_element",
+        "types": types,
+        "angle_cv_unit": "radian",
         "restraints": normalized,
     }
 
@@ -173,11 +260,13 @@ def load_distance_restraints(
         )
 
     topology_atoms = list(topology.atoms())
-    groups: list[tuple[list[int], list[float], list[int], list[float]]] = []
+    groups: list[tuple[list[list[int]], list[list[float]]]] = []
     for item in normalized:
+        restraint_type = item.get("type", "distance")
         selected: list[list[int]] = []
         selected_weights: list[list[float]] = []
-        for key in ("selection_group1", "selection_group2"):
+        for group_index in range(1, _RESTRAINT_GROUP_COUNT[restraint_type] + 1):
+            key = f"selection_group{group_index}"
             try:
                 indices = [int(value) for value in mdtraj_topology.select(item[key])]
             except Exception as exc:
@@ -239,53 +328,109 @@ def load_distance_restraints(
                 )
             selected.append(indices)
             selected_weights.append(weights)
-        overlap = sorted(set(selected[0]) & set(selected[1]))
-        if overlap:
-            raise DistanceRestraintError(
-                code="distance_restraint_groups_overlap",
-                message=(
-                    f"distance restraint {item['name']!r} groups overlap at "
-                    f"{len(overlap)} atoms; use disjoint groups."
-                ),
-            )
-        groups.append((
-            selected[0], selected_weights[0], selected[1], selected_weights[1]
-        ))
+        for first in range(len(selected)):
+            for second in range(first + 1, len(selected)):
+                overlap = sorted(set(selected[first]) & set(selected[second]))
+                if overlap:
+                    raise DistanceRestraintError(
+                        code="distance_restraint_groups_overlap",
+                        message=(
+                            f"distance restraint {item['name']!r} groups "
+                            f"{first + 1} and {second + 1} overlap at "
+                            f"{len(overlap)} atoms; use disjoint groups."
+                        ),
+                    )
+        groups.append((selected, selected_weights))
 
-    force = CustomCentroidBondForce(
-        2, "0.5*k*(distance(g1,g2)-r0)^2"
-    )
-    force.addPerBondParameter("k")
-    force.addPerBondParameter("r0")
-    force.setUsesPeriodicBoundaryConditions(bool(is_periodic))
-    for item, group in zip(normalized, groups):
-        group1, weights1, group2, weights2 = group
-        # Use physical elemental masses rather than the System particle masses:
-        # HMR changes both hydrogen and bonded-heavy-atom masses, but the
-        # scientific COM coordinate must not change when HMR is enabled.
-        group1_id = force.addGroup(group1, weights1)
-        group2_id = force.addGroup(group2, weights2)
-        force.addBond(
-            [group1_id, group2_id],
-            [item["force_constant_kj_mol_nm2"], item["target_distance_nm"]],
+    # One CustomCentroidBondForce carries a single energy expression and a
+    # single groups-per-bond count, so each restraint type needs its own force.
+    forces = []
+    for restraint_type in _RESTRAINT_TYPES:
+        indices = [
+            position
+            for position, item in enumerate(normalized)
+            if item.get("type", "distance") == restraint_type
+        ]
+        if not indices:
+            continue
+        force = CustomCentroidBondForce(
+            _RESTRAINT_GROUP_COUNT[restraint_type],
+            _RESTRAINT_ENERGY[restraint_type],
         )
+        force.addPerBondParameter("k")
+        force.addPerBondParameter("r0")
+        force.setUsesPeriodicBoundaryConditions(bool(is_periodic))
+        for position in indices:
+            item = normalized[position]
+            selected, selected_weights = groups[position]
+            # Use physical elemental masses rather than the System particle
+            # masses: HMR changes both hydrogen and bonded-heavy-atom masses,
+            # but the scientific COM coordinate must not change under HMR.
+            group_ids = [
+                force.addGroup(atom_indices, weights)
+                for atom_indices, weights in zip(selected, selected_weights)
+            ]
+            force.addBond(
+                group_ids,
+                [
+                    item[_RESTRAINT_FORCE_CONSTANT_FIELD[restraint_type]],
+                    item["target_distance_nm"]
+                    if restraint_type == "distance"
+                    # The force works in radians; the schema takes degrees.
+                    else math.radians(item["target_angle_deg"]),
+                ],
+            )
+        forces.append(force)
+
+    def _minimum_image(displacement, box_np):
+        if is_periodic and box_np is not None:
+            fractional = displacement @ np.linalg.inv(box_np)
+            displacement = displacement - np.rint(fractional) @ box_np
+        return displacement
 
     def _evaluator(positions_np, box_np):
         values = {}
         for item, group in zip(normalized, groups):
-            group1, weights1, group2, weights2 = group
-            center1 = np.average(positions_np[group1], axis=0, weights=weights1)
-            center2 = np.average(positions_np[group2], axis=0, weights=weights2)
-            displacement = center2 - center1
-            if is_periodic and box_np is not None:
-                fractional = displacement @ np.linalg.inv(box_np)
-                displacement -= np.rint(fractional) @ box_np
-            values[item["name"]] = float(np.linalg.norm(displacement))
+            restraint_type = item.get("type", "distance")
+            selected, selected_weights = group
+            centers = [
+                np.average(positions_np[atom_indices], axis=0, weights=weights)
+                for atom_indices, weights in zip(selected, selected_weights)
+            ]
+            if restraint_type == "distance":
+                displacement = _minimum_image(centers[1] - centers[0], box_np)
+                values[item["name"]] = float(np.linalg.norm(displacement))
+                continue
+            # Angle and dihedral CVs are reported in radians so that the
+            # logged value pairs directly with force_constant_kj_mol_rad2.
+            if restraint_type == "angle":
+                first = _minimum_image(centers[0] - centers[1], box_np)
+                second = _minimum_image(centers[2] - centers[1], box_np)
+                cosine = float(
+                    np.dot(first, second)
+                    / (np.linalg.norm(first) * np.linalg.norm(second))
+                )
+                values[item["name"]] = float(
+                    np.arccos(min(1.0, max(-1.0, cosine)))
+                )
+                continue
+            # Sign convention must match OpenMM's dihedral(): the first bond
+            # vector points from atom 2 back to atom 1, otherwise the reported
+            # CV comes out negated relative to the bias actually applied.
+            b0 = _minimum_image(centers[0] - centers[1], box_np)
+            b1 = _minimum_image(centers[2] - centers[1], box_np)
+            b2 = _minimum_image(centers[3] - centers[2], box_np)
+            axis = b1 / np.linalg.norm(b1)
+            v = b0 - np.dot(b0, axis) * axis
+            w = b2 - np.dot(b2, axis) * axis
+            values[item["name"]] = float(
+                np.arctan2(np.dot(np.cross(axis, v), w), np.dot(v, w))
+            )
         return values
 
     signature = distance_restraint_signature(normalized)
     return {
-        "forces": [force],
+        "forces": forces,
         "evaluator": _evaluator,
         "cv_names": [item["name"] for item in normalized],
         "kind": signature["kind"],
